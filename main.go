@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"os"
 	"encoding/json"
+	"fmt"
+	"time"
+
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
@@ -24,10 +25,7 @@ type KalshiTrade struct {
 
 func main() {
 	fmt.Println("tfclient starting...")
-	var streamName string = "KALSHI_TRADES"
-	if len(os.Args) > 1 {
-		fmt.Printf("Args: %v\n", os.Args[1:])
-	}
+	streamName := "KALSHI_TRADES"
 
 	nc, err := nats.Connect(VarLabNatsUrl)
 	if err != nil {
@@ -37,7 +35,6 @@ func main() {
 	fmt.Println("Connected to NATS server at", VarLabNatsUrl)
 	defer nc.Close()
 
-	// Create JetStream context
 	js, err := jetstream.New(nc)
 	if err != nil {
 		fmt.Printf("Error creating JetStream context: %v\n", err)
@@ -46,42 +43,48 @@ func main() {
 
 	ctx := context.Background()
 
-	c, err := js.CreateOrUpdateConsumer(ctx, streamName,jetstream.ConsumerConfig{
-			Durable:   "TheGoConsumer", // Durable name
-			Name:  	   "TheGoConsumer", // must match Durable
-			// FilterSubject: "kalshi.trades.KXEPLSPREAD-25DEC13LFCBRI-LFC1",
-			DeliverPolicy: jetstream.DeliverAllPolicy,
-			AckPolicy:     jetstream.AckExplicitPolicy,
+	// Create durable consumer
+	c, err := js.CreateOrUpdateConsumer(ctx, streamName, jetstream.ConsumerConfig{
+		Durable:       "TheGoConsumer",
+		Name:          "TheGoConsumer",
+		DeliverPolicy: jetstream.DeliverAllPolicy,
+		AckPolicy:     jetstream.AckExplicitPolicy,
 	})
 	if err != nil {
 		fmt.Printf("Error creating consumer: %v\n", err)
 		return
 	}
 
-	cons, err := c.Consume(func(msg jetstream.Msg) {
-		var trade KalshiTrade
-		err := json.Unmarshal(msg.Data(), &trade)
-		if err != nil {
-			fmt.Printf("Error unmarshaling message: %v\n", err)
-			msg.Ack() // Acknowledge to avoid redelivery
-			return
-		}
-		msg.Ack()
-		 md, err := msg.Metadata()
-		if err != nil {
-		 	fmt.Printf("Error getting message metadata: %v\n", err)
-		 	return
-		}
-		fmt.Printf("%s (%d) => ticker: %s, event ticker: %s\n", msg.Subject(), md.Sequence.Stream, trade.TickerSlug, trade.EventTicker)
-		fmt.Printf("    price: %v, volume: %v, side: %v, timestamp: %s, msg_type: %s\n", *trade.Price, *trade.Volume, *trade.Side, trade.Timestamp, trade.MsgType)
-	})
-
-	if err != nil {
-		fmt.Printf("Error subscribing to subject: %v\n", err)
-		return
-	}
-	defer cons.Stop()
-
 	fmt.Printf("Subscribed to stream %s\n", streamName)
-	<-ctx.Done()
+
+	for {
+		// Fetch 1 message with short timeout for lower latency
+		msgs, err := c.Fetch(8, jetstream.FetchMaxWait(50*time.Millisecond))
+		if err != nil {
+			if err == context.DeadlineExceeded || err.Error() == "nats: timeout" {
+				continue // No message available, try again
+			}
+			fmt.Printf("Error fetching: %v\n", err)
+			continue
+		}
+
+		for msg := range msgs.Messages() {
+			var trade KalshiTrade
+			err = json.Unmarshal(msg.Data(), &trade)
+			if err != nil {
+				fmt.Printf("Error unmarshaling: %v\n", err)
+				msg.Ack()
+				continue
+			}
+
+			md, _ := msg.Metadata()
+			fmt.Printf("%s (%d) => ticker: %s, event ticker: %s\n", msg.Subject(), md.Sequence.Stream, trade.TickerSlug, trade.EventTicker)
+			if trade.MsgType == "trade" && trade.Price != nil && trade.Volume != nil && trade.Side != nil {
+				fmt.Printf("    price: %d, volume: %d, side: %s, timestamp: %s\n", *trade.Price, *trade.Volume, *trade.Side, trade.Timestamp)
+			} else {
+				fmt.Printf("    msg_type: %s, timestamp: %s\n", trade.MsgType, trade.Timestamp)
+			}
+			msg.Ack()
+		}
+	}
 }
