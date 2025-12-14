@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"time"
+	"os"
+	"os/signal"
 
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
@@ -24,6 +26,35 @@ type KalshiTrade struct {
 }
 
 func main() {
+	var last_trade map[string]KalshiTrade = make(map[string]KalshiTrade)
+
+	// var myArray [16]int64
+	// myArray[0] = 42
+	// mySlice := myArray[:8]
+	// fmt.Println("mySlice:", mySlice)
+	var done bool = false
+	var lastSeq uint64 = 0
+
+	// read last seq from file
+	if data, err := os.ReadFile("last_seq.txt"); err == nil {
+		_, err := fmt.Sscanf(string(data), "%d", &lastSeq)
+		if err != nil {
+			fmt.Printf("Error reading last_seq.txt: %v\n", err)
+		} else {
+			fmt.Printf("Resuming from last sequence: %d\n", lastSeq)
+		}
+	}
+
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt)
+	go func(){
+			for sig := range sigchan {
+				fmt.Println("Received signal:", sig)
+				done = true
+			}
+	}()
+
+
 	fmt.Println("tfclient starting...")
 	streamName := "KALSHI_TRADES"
 
@@ -57,9 +88,10 @@ func main() {
 
 	fmt.Printf("Subscribed to stream %s\n", streamName)
 
-	for {
+	var msgCount int64 = 0
+	for done == false {
 		// Fetch 1 message with short timeout for lower latency
-		msgs, err := c.Fetch(8, jetstream.FetchMaxWait(50*time.Millisecond))
+		msgs, err := c.Fetch(128, jetstream.FetchMaxWait(50*time.Millisecond))
 		if err != nil {
 			if err == context.DeadlineExceeded || err.Error() == "nats: timeout" {
 				continue // No message available, try again
@@ -76,15 +108,45 @@ func main() {
 				msg.Ack()
 				continue
 			}
+			last_trade[trade.TickerSlug] = trade
 
 			md, _ := msg.Metadata()
-			fmt.Printf("%s (%d) => ticker: %s, event ticker: %s\n", msg.Subject(), md.Sequence.Stream, trade.TickerSlug, trade.EventTicker)
-			if trade.MsgType == "trade" && trade.Price != nil && trade.Volume != nil && trade.Side != nil {
-				fmt.Printf("    price: %d, volume: %d, side: %s, timestamp: %s\n", *trade.Price, *trade.Volume, *trade.Side, trade.Timestamp)
-			} else {
-				fmt.Printf("    msg_type: %s, timestamp: %s\n", trade.MsgType, trade.Timestamp)
+			if lastSeq == 0 {
+				fmt.Printf("Starting at sequence %d\n", md.Sequence.Stream)
 			}
+			if (lastSeq + 1) != md.Sequence.Stream {
+				fmt.Printf("WARNING: Detected gap in sequence! lastSeq: %d, currentSeq: %d\n", lastSeq, md.Sequence.Stream)
+			}
+			lastSeq = md.Sequence.Stream
+
+			// fmt.Printf("%s (%d) => ticker: %s, event ticker: %s\n", msg.Subject(), md.Sequence.Stream, trade.TickerSlug, trade.EventTicker)
+			// if trade.MsgType == "trade" && trade.Price != nil && trade.Volume != nil && trade.Side != nil {
+			// 	fmt.Printf("    price: %d, volume: %d, side: %s, timestamp: %s\n", *trade.Price, *trade.Volume, *trade.Side, trade.Timestamp)
+			// } else {
+			// 	fmt.Printf("    msg_type: %s, timestamp: %s\n", trade.MsgType, trade.Timestamp)
+			// }
 			msg.Ack()
+			msgCount++
+			if msgCount%256 == 0 {
+				fmt.Printf("Processed %d messages last seq %d keys %d\n", msgCount, md.Sequence.Stream, len(last_trade))
+			}
 		}
+	}
+
+	fmt.Println("Shutting down tfclient...")
+	fmt.Println("Final processed message count:", msgCount)
+	fmt.Println("Final last sequenece:", lastSeq)
+
+	// write last seq to file
+	f, err := os.Create("last_seq.txt")
+	if err != nil {
+		fmt.Printf("Error creating last_seq.txt: %v\n", err)
+		return
+	}
+	defer f.Close()
+	_, err = f.WriteString(fmt.Sprintf("%d\n", lastSeq))
+	if err != nil {
+		fmt.Printf("Error writing to last_seq.txt: %v\n", err)
+		return
 	}
 }
