@@ -44,6 +44,7 @@ func main() {
 			fmt.Printf("Resuming from last sequence: %d\n", lastSeq)
 		}
 	}
+	var pendingCount uint64= 0
 
 	sigchan := make(chan os.Signal, 1)
 	signal.Notify(sigchan, os.Interrupt)
@@ -86,12 +87,30 @@ func main() {
 		return
 	}
 
-	fmt.Printf("Subscribed to stream %s\n", streamName)
 
-	var msgCount int64 = 0
+
+	fmt.Printf("Subscribed to stream %s\n", streamName)
+	var fetchSize int = 32
+	var conInfo* jetstream.ConsumerInfo = c.CachedInfo()
+	if conInfo != nil {
+		fmt.Printf("Consumer info: Delivered %d, Acked %d, Pending %d\n",
+			conInfo.Delivered.Stream,
+			conInfo.AckFloor.Stream,
+			conInfo.NumPending,
+		)
+		pendingCount = conInfo.NumPending
+		if conInfo.NumPending > 1000 {
+			fetchSize = 1024
+			fmt.Printf("Setting fetch size to %d due to pending messages\n", fetchSize)
+		}
+	}
+
+	var msgCount uint64 = 0
+
 	for done == false {
+
 		// Fetch 1 message with short timeout for lower latency
-		msgs, err := c.Fetch(128, jetstream.FetchMaxWait(50*time.Millisecond))
+		msgs, err := c.Fetch(fetchSize, jetstream.FetchMaxWait(50*time.Millisecond))
 		if err != nil {
 			if err == context.DeadlineExceeded || err.Error() == "nats: timeout" {
 				continue // No message available, try again
@@ -129,6 +148,16 @@ func main() {
 			msgCount++
 			if msgCount%256 == 0 {
 				fmt.Printf("Processed %d messages last seq %d keys %d\n", msgCount, md.Sequence.Stream, len(last_trade))
+
+				// if startSeq > 0 && (startSeq+msgCount) >= lastSeq {
+				// 	fetchSize = 32
+				// 	fmt.Println("Slowing fetch size to 32...	")
+				// }
+				if pendingCount > 0 && msgCount > pendingCount {
+					fetchSize = 32
+					fmt.Println("Slowing fetch size to 32...	")
+					pendingCount = 0
+				}
 			}
 		}
 	}
